@@ -261,7 +261,7 @@ export default function Landing() {
       </section>
 
       {/* BACKED BY */}
-      <section className="bg-[#F5F5F5] px-6 py-16 border-t border-b border-black/5 w-full">
+      { /* <section className="bg-[#F5F5F5] px-6 py-16 border-t border-b border-black/5 w-full">
         <div className="max-w-[88rem] mx-auto grid grid-cols-1 md:grid-cols-4 gap-8 items-center">
           <div className="text-black/70 text-base leading-relaxed font-sans font-light">
             Funded by premier partners
@@ -279,6 +279,7 @@ export default function Landing() {
           </div>
         </div>
       </section>
+*/}
 
       {/* USE MODES — each tab now opens the profile it describes */}
       <section id="modes" className="bg-[#F5F5F5] px-6 py-24 w-full scroll-mt-8">
@@ -304,17 +305,15 @@ export default function Landing() {
                   key={mode}
                   onClick={() => setActiveUseCase(mode)}
                   aria-pressed={activeUseCase === mode}
-                  className={`w-full text-left px-5 py-4 rounded-xl border transition-all duration-200 flex items-center justify-between cursor-pointer font-barlow ${
-                    activeUseCase === mode
+                  className={`w-full text-left px-5 py-4 rounded-xl border transition-all duration-200 flex items-center justify-between cursor-pointer font-barlow ${activeUseCase === mode
                       ? "bg-black text-white border-black shadow-sm font-semibold"
                       : "bg-white/50 text-gray-700 border-black/10 hover:border-black/30 hover:bg-white"
-                  }`}
+                    }`}
                 >
                   <span className="capitalize">{mode}</span>
                   <ArrowRight
-                    className={`w-4 h-4 transition-transform duration-200 ${
-                      activeUseCase === mode ? "translate-x-1 text-white" : "text-gray-400"
-                    }`}
+                    className={`w-4 h-4 transition-transform duration-200 ${activeUseCase === mode ? "translate-x-1 text-white" : "text-gray-400"
+                      }`}
                   />
                 </button>
               ))}
