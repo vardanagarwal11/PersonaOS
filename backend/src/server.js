@@ -41,7 +41,14 @@ async function saveStore(s) {
 }
 
 const app = Fastify({ logger: true });
-await app.register(cors, { origin: true });
+
+// CORS_ORIGIN is a comma-separated allowlist of frontend origins in production
+// (e.g. "https://personaos.vercel.app"). Unset means open — fine for local dev,
+// but set it once the frontend is deployed so only it can call the API.
+const corsEnv = process.env.CORS_ORIGIN;
+await app.register(cors, {
+  origin: corsEnv ? corsEnv.split(",").map((s) => s.trim()) : true,
+});
 await app.register(multipart, { limits: { fileSize: 8 * 1024 * 1024 } });
 
 app.get("/health", async () => ({ ok: true, issuer: issuer.publicKey(), ai: AI_ENABLED }));
