@@ -1,22 +1,83 @@
-import { signTransaction, getNetworkDetails } from "@stellar/freighter-api";
+import freighter from "@stellar/freighter-api";
+
+const { signTransaction, signMessage, getNetworkDetails } = freighter;
 
 export const API = process.env.NEXT_PUBLIC_API || "http://localhost:4000";
 
+const TOKEN_KEY = "personaos.token";
+
+/** Browsers have no Buffer; go through binary string to base64. */
+function bytesToBase64(bytes) {
+  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  let bin = "";
+  for (const b of arr) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+
+export const getToken = () =>
+  typeof window === "undefined" ? null : sessionStorage.getItem(TOKEN_KEY);
+export const setToken = (t) => sessionStorage.setItem(TOKEN_KEY, t);
+export const clearToken = () => sessionStorage.removeItem(TOKEN_KEY);
+
 export async function api(path, opts = {}) {
+  const token = getToken();
   let res;
   try {
     res = await fetch(`${API}${path}`, {
-      headers: { "content-type": "application/json" },
       ...opts,
+      headers: {
+        "content-type": "application/json",
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+        ...opts.headers,
+      },
     });
   } catch {
     // The server is the only thing on the other side of this call, so a network
     // failure means one thing: it isn't running.
     throw new Error("PersonaOS can't reach its server. Make sure the backend is running.");
   }
+
+  if (res.status === 401) {
+    clearToken();
+    throw new Error("Your session expired. Connect your wallet again.");
+  }
+
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(body.error || `The server returned ${res.status}.`);
   return body;
+}
+
+/**
+ * Prove to the server that this browser holds the address, by signing a nonce
+ * with Freighter. The resulting token gates every vault and proof operation —
+ * without it, anyone could write to anyone's economic memory.
+ */
+export async function signIn(address) {
+  const { message } = await api("/auth/challenge", {
+    method: "POST",
+    body: JSON.stringify({ address }),
+  });
+
+  const signed = await signMessage(message, { address });
+  if (signed?.error) {
+    const m = String(signed.error.message || signed.error).toLowerCase();
+    if (m.includes("declin") || m.includes("reject") || m.includes("cancel")) {
+      throw new Error("You declined the signature, so you're not signed in.");
+    }
+    throw new Error("Freighter couldn't sign the request. Check that it's unlocked.");
+  }
+
+  // Freighter returns the signature as a base64 string or as bytes depending on
+  // version; normalise both to base64.
+  const raw = signed.signedMessage ?? signed;
+  const signature = typeof raw === "string" ? raw : bytesToBase64(raw);
+
+  const { token } = await api("/auth/verify", {
+    method: "POST",
+    body: JSON.stringify({ address, signature }),
+  });
+  setToken(token);
+  return token;
 }
 
 /* Wallet connection lives in app/wallet.js — it owns the typed error states. */
@@ -77,9 +138,25 @@ export async function ingestBank(subjectPub, file) {
   const form = new FormData();
   form.append("subjectPub", subjectPub);
   form.append("file", file);
-  const res = await fetch(`${API}/ingest/bank`, { method: "POST", body: form });
+
+  const token = getToken();
+  let res;
+  try {
+    res = await fetch(`${API}/ingest/bank`, {
+      method: "POST",
+      body: form,
+      headers: token ? { authorization: `Bearer ${token}` } : {},
+    });
+  } catch {
+    throw new Error("PersonaOS can't reach its server. Make sure the backend is running.");
+  }
+
+  if (res.status === 401) {
+    clearToken();
+    throw new Error("Your session expired. Connect your wallet again.");
+  }
   const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+  if (!res.ok) throw new Error(body.error || `The server returned ${res.status}.`);
   return body;
 }
 

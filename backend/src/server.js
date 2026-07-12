@@ -12,6 +12,7 @@ import { buildProfile, PROFILE_TYPES } from "./profiles.js";
 import { loadVault, mergeVault, saveVault } from "./vault.js";
 import { parseBankCsv, parseGithub, parseResumeText, parseLinkedInExport } from "./ingest.js";
 import { classifyTransactions, buildAiProfile, aggregateFacts } from "./gemini.js";
+import { createChallenge, verifyChallenge, addressFromToken, requireOwner } from "./auth.js";
 
 const AI_ENABLED = !!process.env.GEMINI_API_KEY;
 
@@ -50,21 +51,34 @@ async function classifyAndStore(userId, record) {
   if (!AI_ENABLED) return record;
   const unclassified = record.transactions.filter((t) => !t.category);
   if (!unclassified.length) return record;
+
   const BATCH = 80; // free-tier friendly (§5.4)
+  let classifiedAny = false;
+
   for (let i = 0; i < unclassified.length; i += BATCH) {
     const slice = unclassified.slice(i, i + BATCH);
-    const results = await classifyTransactions(slice);
-    const map = new Map(results.map((r) => [r.id, r]));
-    for (const t of record.transactions) {
-      const r = map.get(t.id);
-      if (r) {
-        t.category = r.category;
-        t.meaning = r.meaning;
-        t.confidence = r.confidence;
+    try {
+      const results = await classifyTransactions(slice);
+      const map = new Map(results.map((r) => [r.id, r]));
+      for (const t of record.transactions) {
+        const r = map.get(t.id);
+        if (r) {
+          t.category = r.category;
+          t.meaning = r.meaning;
+          t.confidence = r.confidence;
+          classifiedAny = true;
+        }
       }
+    } catch (e) {
+      // The upload already succeeded — the data is safely in the vault. A failed
+      // classification just leaves those transactions unlabelled, and the next
+      // ingest or issue picks them up. Losing the upload would be far worse.
+      app.log.warn({ err: e.message }, "classification batch failed; leaving batch unclassified");
+      break;
     }
   }
-  await saveVault(userId, record);
+
+  if (classifiedAny) await saveVault(userId, record);
   return record;
 }
 
@@ -87,14 +101,50 @@ app.get("/config", async () => ({
   issuer: issuer.publicKey(),
 }));
 
+// ---------- Auth (proof of key ownership) ----------
+// A person's Stellar address is their identity, so they prove they hold it by
+// signing a nonce. Everything that touches a vault requires that proof.
+
+/** Step 1: get a challenge to sign. Body: { address } */
+app.post("/auth/challenge", async (req, reply) => {
+  const { address } = req.body || {};
+  if (!address) return reply.code(400).send({ error: "address required" });
+  return { message: createChallenge(address) };
+});
+
+/** Step 2: exchange the signed challenge for a token. Body: { address, signature } */
+app.post("/auth/verify", async (req, reply) => {
+  const { address, signature } = req.body || {};
+  if (!address || !signature) return reply.code(400).send({ error: "address and signature required" });
+  try {
+    return { token: verifyChallenge(address, signature) };
+  } catch (e) {
+    return reply.code(401).send({ error: e.message });
+  }
+});
+
 // ---------- Ingestion (§4) ----------
 // All ingestion writes to the per-user encrypted vault and classifies new txns.
+// Every route below is owner-gated: you can only feed your own Twin.
 
-/** Bank statement CSV upload (multipart file "file", field "subjectPub"). */
+const ownsBody = requireOwner((req) => req.body?.subjectPub);
+const ownsParam = requireOwner((req) => req.params.subjectPub);
+
+/**
+ * Bank statement CSV upload (multipart: field "subjectPub", file "file").
+ * Multipart bodies aren't parsed before the preHandler runs, so this route
+ * authorises after reading the parts rather than via requireOwner.
+ */
 app.post("/ingest/bank", async (req, reply) => {
   const parts = await collectMultipart(req);
   const subjectPub = parts.fields.subjectPub;
   if (!subjectPub || !parts.file) return reply.code(400).send({ error: "subjectPub and file required" });
+
+  const header = req.headers.authorization || "";
+  const caller = addressFromToken(header.startsWith("Bearer ") ? header.slice(7) : null);
+  if (!caller) return reply.code(401).send({ error: "Connect your wallet to continue." });
+  if (caller !== subjectPub) return reply.code(403).send({ error: "You can only act on your own account." });
+
   const partial = parseBankCsv(parts.file.toString("utf8"), parts.fields.currency || "INR");
   let rec = await mergeVault(subjectPub, partial);
   rec = await classifyAndStore(subjectPub, rec);
@@ -102,7 +152,7 @@ app.post("/ingest/bank", async (req, reply) => {
 });
 
 /** GitHub public profile ingest. Body: { subjectPub, username } */
-app.post("/ingest/github", async (req, reply) => {
+app.post("/ingest/github", { preHandler: ownsBody }, async (req, reply) => {
   const { subjectPub, username } = req.body || {};
   if (!subjectPub || !username) return reply.code(400).send({ error: "subjectPub and username required" });
   const partial = await parseGithub(username);
@@ -111,7 +161,7 @@ app.post("/ingest/github", async (req, reply) => {
 });
 
 /** Resume text ingest. Body: { subjectPub, text } */
-app.post("/ingest/resume", async (req, reply) => {
+app.post("/ingest/resume", { preHandler: ownsBody }, async (req, reply) => {
   const { subjectPub, text } = req.body || {};
   if (!subjectPub || !text) return reply.code(400).send({ error: "subjectPub and text required" });
   const partial = parseResumeText(text);
@@ -123,7 +173,7 @@ app.post("/ingest/resume", async (req, reply) => {
 });
 
 /** LinkedIn export ingest. Body: { subjectPub, positionsCsv?, skillsCsv? } */
-app.post("/ingest/linkedin", async (req, reply) => {
+app.post("/ingest/linkedin", { preHandler: ownsBody }, async (req, reply) => {
   const { subjectPub, positionsCsv, skillsCsv } = req.body || {};
   if (!subjectPub) return reply.code(400).send({ error: "subjectPub required" });
   const partial = parseLinkedInExport({ positionsCsv, skillsCsv });
@@ -132,7 +182,7 @@ app.post("/ingest/linkedin", async (req, reply) => {
 });
 
 /** Vault summary for the UI (no raw descriptions — aggregated facts only). */
-app.get("/vault/:subjectPub", async (req) => {
+app.get("/vault/:subjectPub", { preHandler: ownsParam }, async (req) => {
   const rec = await loadVault(req.params.subjectPub);
   return {
     transactionCount: rec.transactions.length,
@@ -174,10 +224,12 @@ app.post("/consent/submit", async (req, reply) => {
  * store's flag is only a cache — a proof revoked by another client, or by a
  * previous run of this server, would otherwise still show as standing here.
  */
-app.get("/list", async (req) => {
+app.get("/list", { preHandler: requireOwner((req) => req.query.subject) }, async (req) => {
   const store = await loadStore();
-  const subject = req.query.subject;
-  const rows = Object.entries(store).filter(([, r]) => !subject || r.subjectPub === subject);
+  // Always scope to the authenticated caller. Falling back to "everything" when
+  // no subject is given would hand one token-holder every user's proofs.
+  const subject = req.caller;
+  const rows = Object.entries(store).filter(([, r]) => r.subjectPub === subject);
 
   // Reconcile against the chain, but never let a slow or unreachable RPC hang
   // the dashboard: each lookup races a short timeout and falls back to the
@@ -220,28 +272,31 @@ app.get("/list", async (req) => {
  * With real Freighter flow, consent is already on-chain (via /consent/*), so
  * subjectSecret is omitted; the contract rejects attest if consent is missing.
  */
-app.post("/persona/:type", async (req, reply) => {
+app.post("/persona/:type", { preHandler: ownsBody }, async (req, reply) => {
   const type = req.params.type;
   if (!PROFILE_TYPES.includes(type)) {
     return reply.code(400).send({ error: `unknown profile type ${type}` });
   }
-  const { subjectPub, subjectSecret, nonce = 1 } = req.body || {};
+  const { subjectPub, nonce = 1 } = req.body || {};
   if (!subjectPub) return reply.code(400).send({ error: "subjectPub required" });
 
-  // MVP: server records consent on behalf of subject if secret provided.
-  if (subjectSecret) {
-    await chain.grantConsent(Keypair.fromSecret(subjectSecret), type);
-  }
+  // Consent must already be on-chain (granted via /consent/* with the subject's
+  // own key). The contract rejects attest() without it, so there is no path here
+  // that issues a proof the subject didn't agree to.
 
   // AI path: generate from the user's economic-memory facts. Falls back to the
-  // mock builder when AI is off or the vault is empty (keeps the demo working).
+  // mock builder when AI is off, the vault is empty, or the AI is unreachable.
   let profile;
   if (AI_ENABLED) {
-    let rec = await loadVault(subjectPub);
-    rec = await classifyAndStore(subjectPub, rec);
-    const facts = aggregateFacts(rec);
-    if (rec.transactions.length || rec.work.length) {
-      profile = await buildAiProfile(type, { subjectPub, facts, resumeText: rec.resumeText });
+    try {
+      let rec = await loadVault(subjectPub);
+      rec = await classifyAndStore(subjectPub, rec);
+      const facts = aggregateFacts(rec);
+      if (rec.transactions.length || rec.work.length) {
+        profile = await buildAiProfile(type, { subjectPub, facts, resumeText: rec.resumeText });
+      }
+    } catch (e) {
+      app.log.warn({ err: e.message }, "AI profile generation failed; using baseline profile");
     }
   }
   if (!profile) profile = buildProfile(type, { subjectPub });
@@ -300,15 +355,24 @@ app.get("/verify/:id", async (req, reply) => {
   };
 });
 
-app.post("/revoke/:id", async (req, reply) => {
-  const idHex = req.params.id;
-  const store = await loadStore();
-  if (!store[idHex]) return reply.code(404).send({ error: "not found" });
-  await chain.revoke(issuer, Buffer.from(idHex, "hex"));
-  store[idHex].revoked = true;
-  await saveStore(store);
-  return { revoked: true, attestationId: idHex };
-});
+/**
+ * Withdraw a proof. Only the person the proof is about can withdraw it — the
+ * server signs the on-chain revocation with the issuer key, so without this
+ * check anyone could invalidate anyone else's credentials.
+ */
+app.post(
+  "/revoke/:id",
+  { preHandler: requireOwner(async (req) => (await loadStore())[req.params.id]?.subjectPub) },
+  async (req, reply) => {
+    const idHex = req.params.id;
+    const store = await loadStore();
+    if (!store[idHex]) return reply.code(404).send({ error: "not found" });
+    await chain.revoke(issuer, Buffer.from(idHex, "hex"));
+    store[idHex].revoked = true;
+    await saveStore(store);
+    return { revoked: true, attestationId: idHex };
+  }
+);
 
 const port = Number(process.env.PORT || 3000);
 app.listen({ port, host: "0.0.0.0" }).catch((e) => {

@@ -1,6 +1,9 @@
 "use client";
 import { createContext, useContext, useState, useEffect, useCallback } from "react";
-import { isConnected, requestAccess, getAddress } from "@stellar/freighter-api";
+import freighter from "@stellar/freighter-api";
+import { signIn, getToken, clearToken } from "../lib/emp";
+
+const { isConnected, requestAccess, getAddress } = freighter;
 
 const Ctx = createContext(null);
 
@@ -62,8 +65,9 @@ export function WalletProvider({ children }) {
   const [connecting, setConnecting] = useState(false);
 
   useEffect(() => {
-    // Dev-only: ?as=G… renders the connected screens without a browser wallet.
-    // Read-only surfaces work; anything needing a signature still needs Freighter.
+    // Dev-only: ?as=G… previews the connected screens without a browser wallet.
+    // It cannot mint a session token (that needs a real signature), so the
+    // screens render but data calls will 401 — which is the correct behaviour.
     if (process.env.NODE_ENV === "development") {
       const as = new URLSearchParams(window.location.search).get("as");
       if (as) {
@@ -71,6 +75,9 @@ export function WalletProvider({ children }) {
         return;
       }
     }
+    // Only restore the session if we still hold a token — otherwise every
+    // request would 401 and the screens would look connected but be empty.
+    if (!getToken()) return;
     getAddress()
       .then((r) => r.address && setAddress(r.address))
       .catch(() => {});
@@ -97,8 +104,12 @@ export function WalletProvider({ children }) {
       if (error) throw new Error(typeof error === "string" ? error : error.message);
       if (!addr) throw new Error("declined");
 
+      // Prove we hold the key before touching anything. One signature, then the
+      // session token gates every vault and proof call.
+      await signIn(addr);
       setAddress(addr);
     } catch (e) {
+      clearToken();
       setErrorCode(classify(e));
     } finally {
       setConnecting(false);
@@ -106,6 +117,7 @@ export function WalletProvider({ children }) {
   }, []);
 
   const disconnect = useCallback(() => {
+    clearToken();
     setAddress("");
     setErrorCode("");
   }, []);

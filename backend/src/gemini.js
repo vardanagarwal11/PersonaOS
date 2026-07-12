@@ -24,14 +24,34 @@ function ai() {
   return _client;
 }
 
-async function generateJson(prompt, responseSchema) {
-  const res = await ai().models.generateContent({
-    model: MODEL,
-    contents: prompt,
-    config: { responseMimeType: "application/json", responseSchema },
-  });
-  const text = typeof res.text === "function" ? res.text() : res.text;
-  return JSON.parse(text);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * The free tier throttles: 429 and 503 are routine, not exceptional. Retry them
+ * with backoff rather than letting a transient spike fail the user's upload.
+ * Anything else (a bad key, a bad schema) fails fast — retrying won't help.
+ */
+async function generateJson(prompt, responseSchema, attempt = 0) {
+  const MAX_ATTEMPTS = 4;
+  try {
+    const res = await ai().models.generateContent({
+      model: MODEL,
+      contents: prompt,
+      config: { responseMimeType: "application/json", responseSchema },
+    });
+    const text = typeof res.text === "function" ? res.text() : res.text;
+    if (!text) throw new Error("Gemini returned an empty response.");
+    return JSON.parse(text);
+  } catch (e) {
+    const msg = String(e?.message || e);
+    const transient = /429|503|overload|rate.?limit|unavailable|high demand|timeout|ECONN/i.test(msg);
+    if (transient && attempt < MAX_ATTEMPTS - 1) {
+      await sleep(2 ** attempt * 1000 + Math.floor(attempt * 250)); // 1s, 2s, 4s
+      return generateJson(prompt, responseSchema, attempt + 1);
+    }
+    if (transient) throw new Error("The AI service is busy right now. Try again in a moment.");
+    throw e;
+  }
 }
 
 // --- 5.1 transaction classification (batched) ---
