@@ -1,33 +1,25 @@
-import {
-  isConnected,
-  requestAccess,
-  getAddress,
-  signTransaction,
-  getNetworkDetails,
-} from "@stellar/freighter-api";
+import { signTransaction, getNetworkDetails } from "@stellar/freighter-api";
 
-export const API = process.env.NEXT_PUBLIC_API || "http://localhost:3000";
+export const API = process.env.NEXT_PUBLIC_API || "http://localhost:4000";
 
 export async function api(path, opts = {}) {
-  const res = await fetch(`${API}${path}`, {
-    headers: { "content-type": "application/json" },
-    ...opts,
-  });
+  let res;
+  try {
+    res = await fetch(`${API}${path}`, {
+      headers: { "content-type": "application/json" },
+      ...opts,
+    });
+  } catch {
+    // The server is the only thing on the other side of this call, so a network
+    // failure means one thing: it isn't running.
+    throw new Error("PersonaOS can't reach its server. Make sure the backend is running.");
+  }
   const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+  if (!res.ok) throw new Error(body.error || `The server returned ${res.status}.`);
   return body;
 }
 
-/** Connect Freighter, return the user's Stellar address (= subject identity). */
-export async function connectWallet() {
-  if (!(await isConnected())) {
-    throw new Error("Freighter not detected. Install the Freighter extension.");
-  }
-  await requestAccess();
-  const { address, error } = await getAddress();
-  if (error) throw new Error(error);
-  return address;
-}
+/* Wallet connection lives in app/wallet.js — it owns the typed error states. */
 
 /**
  * Full consent flow with real Freighter signing:
@@ -40,12 +32,24 @@ export async function grantConsent(subjectPub, type) {
     method: "POST",
     body: JSON.stringify({ subjectPub, type }),
   });
-  const net = await getNetworkDetails();
-  const { signedTxXdr, error } = await signTransaction(xdr, {
-    networkPassphrase: net.networkPassphrase,
-    address: subjectPub,
-  });
-  if (error) throw new Error(typeof error === "string" ? error : error.message);
+
+  let signedTxXdr;
+  try {
+    const net = await getNetworkDetails();
+    const signed = await signTransaction(xdr, {
+      networkPassphrase: net.networkPassphrase,
+      address: subjectPub,
+    });
+    if (signed.error) throw new Error(typeof signed.error === "string" ? signed.error : signed.error.message);
+    signedTxXdr = signed.signedTxXdr;
+  } catch (e) {
+    const m = String(e?.message || e).toLowerCase();
+    if (m.includes("declin") || m.includes("reject") || m.includes("denied") || m.includes("cancel")) {
+      throw new Error("You declined the signature, so nothing was issued. Approve it in Freighter to continue.");
+    }
+    throw new Error("Freighter couldn't sign the consent. Check that it's unlocked and set to Testnet.");
+  }
+
   const { hash } = await api("/consent/submit", {
     method: "POST",
     body: JSON.stringify({ signedXdr: signedTxXdr }),
@@ -63,3 +67,24 @@ export function issueProfile(subjectPub, type, nonce = Date.now()) {
 export const verify = (id) => api(`/verify/${id}`);
 export const revoke = (id) => api(`/revoke/${id}`, { method: "POST" });
 export const list = (subject) => api(`/list${subject ? `?subject=${subject}` : ""}`);
+
+/* ---- Vault + ingestion ---- */
+
+export const getVault = (subject) => api(`/vault/${subject}`);
+
+/** Bank CSV is multipart, so it bypasses the JSON `api` helper. */
+export async function ingestBank(subjectPub, file) {
+  const form = new FormData();
+  form.append("subjectPub", subjectPub);
+  form.append("file", file);
+  const res = await fetch(`${API}/ingest/bank`, { method: "POST", body: form });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+  return body;
+}
+
+export const ingestGithub = (subjectPub, username) =>
+  api("/ingest/github", { method: "POST", body: JSON.stringify({ subjectPub, username }) });
+
+export const ingestResume = (subjectPub, text) =>
+  api("/ingest/resume", { method: "POST", body: JSON.stringify({ subjectPub, text }) });

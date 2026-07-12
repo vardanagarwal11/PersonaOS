@@ -60,6 +60,27 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/**
+ * Read-only call. Simulates the invocation and reads the return value without
+ * signing, submitting, or waiting for a ledger to close — so view functions
+ * cost nothing and return in a single round trip instead of ~5 seconds.
+ */
+async function simulate(sourceKeypair, method, ...scArgs) {
+  const account = await server.getAccount(sourceKeypair.publicKey());
+  const tx = new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase: NETWORK_PASSPHRASE,
+  })
+    .addOperation(contract().call(method, ...scArgs))
+    .setTimeout(30)
+    .build();
+
+  const sim = await server.simulateTransaction(tx);
+  if (rpc.Api.isSimulationError(sim)) throw new Error(sim.error);
+  if (!sim.result?.retval) return null;
+  return scValToNative(sim.result.retval);
+}
+
 const addr = (pub) => nativeToScVal(pub, { type: "address" });
 const sym = (s) => nativeToScVal(s, { type: "symbol" });
 const bytes32 = (buf) => nativeToScVal(buf, { type: "bytes" });
@@ -86,17 +107,23 @@ export function attest(issuerKeypair, { id, subjectPub, profileType, hash }) {
   );
 }
 
-/** Public read: does an attestation with this id match this hash and is live? */
+/** Read: does an attestation with this id match this hash and still stand? */
 export function verify(readerKeypair, id, hash) {
-  return invoke(readerKeypair, "verify", bytes32(id), bytes32(hash));
+  return simulate(readerKeypair, "verify", bytes32(id), bytes32(hash));
 }
 
 export function revoke(callerKeypair, id) {
   return invoke(callerKeypair, "revoke", bytes32(id), addr(callerKeypair.publicKey()));
 }
 
+/** Read: the full attestation record, including its revocation flag. */
 export function getAttestation(readerKeypair, id) {
-  return invoke(readerKeypair, "get", bytes32(id));
+  return simulate(readerKeypair, "get", bytes32(id));
+}
+
+/** Read: has this subject consented to this profile type? */
+export function hasConsent(readerKeypair, subjectPub, profileType) {
+  return simulate(readerKeypair, "has_consent", addr(subjectPub), sym(profileType));
 }
 
 /**

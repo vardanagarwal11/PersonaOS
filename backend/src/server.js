@@ -167,20 +167,51 @@ app.post("/consent/submit", async (req, reply) => {
   return { hash };
 });
 
-/** List issued attestations (dashboard). Optional ?subject=G... filter. */
+/**
+ * List issued attestations (dashboard). Optional ?subject=G... filter.
+ *
+ * Revocation state is read from the contract, not from the local store. The
+ * store's flag is only a cache — a proof revoked by another client, or by a
+ * previous run of this server, would otherwise still show as standing here.
+ */
 app.get("/list", async (req) => {
   const store = await loadStore();
   const subject = req.query.subject;
-  return Object.entries(store)
-    .filter(([, r]) => !subject || r.subjectPub === subject)
-    .map(([id, r]) => ({
-      attestationId: id,
-      profileType: r.profileType,
-      subjectPub: r.subjectPub,
-      confidence: r.profile.confidence,
-      revoked: !!r.revoked,
-      createdAt: r.createdAt,
-    }));
+  const rows = Object.entries(store).filter(([, r]) => !subject || r.subjectPub === subject);
+
+  // Reconcile against the chain, but never let a slow or unreachable RPC hang
+  // the dashboard: each lookup races a short timeout and falls back to the
+  // cached flag. Results are written back so the cache self-heals.
+  const withTimeout = (p, ms) =>
+    Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), ms))]);
+
+  let dirty = false;
+  const out = await Promise.all(
+    rows.map(async ([id, r]) => {
+      let revoked = !!r.revoked;
+      try {
+        const att = await withTimeout(chain.getAttestation(issuer, Buffer.from(id, "hex")), 4000);
+        if (!!att.revoked !== revoked) {
+          revoked = !!att.revoked;
+          store[id].revoked = revoked;
+          dirty = true;
+        }
+      } catch {
+        // Keep the cached flag rather than failing the whole list.
+      }
+      return {
+        attestationId: id,
+        profileType: r.profileType,
+        subjectPub: r.subjectPub,
+        confidence: r.profile.confidence,
+        revoked,
+        createdAt: r.createdAt,
+      };
+    })
+  );
+
+  if (dirty) await saveStore(store);
+  return out;
 });
 
 /**
