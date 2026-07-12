@@ -115,3 +115,34 @@ A verifier trusts a profile iff all three hold:
 3. `onchain.revoked == false` — validity
 
 Contract `verify(id, hash)` folds checks 2+3; the server does check 1.
+
+## Auth model
+
+The Stellar address is the identity. A user proves they hold it by signing a
+nonce with Freighter (`/auth/challenge` → `/auth/verify`), receiving a
+short-lived HMAC session token. Every vault- or proof-touching route
+(`/ingest/*`, `/vault`, `/list`, `/persona`, `/revoke`) requires that token
+**and** that it proves ownership of the subject being acted on. `/verify` is
+intentionally public — a verifier must be able to check a proof without an
+account.
+
+## Known limitations (before production)
+
+This is a hackathon build. What's solid: the contract, the crypto (Ed25519
+signing, AES-256-GCM vault, canonical-JSON hashing), the auth model, and the
+AI pipeline with retry/fallback. What must change before real use:
+
+- **Storage is a JSON file, not a database.** `attestations.json` and the vault
+  files are read-modify-write with no locking, so concurrent requests to the
+  same record can clobber each other (a lost write on simultaneous issue or
+  ingest). Single-user demo traffic never hits this; production must move to a
+  real datastore (Postgres, or per-user rows with row-level locking) — this is
+  the first thing to replace.
+- **Vault master key is an env secret**, not a KMS. Rotating it makes existing
+  encrypted vaults unreadable. Move to a managed KMS with envelope encryption.
+- **Consent is MVP-simple.** The contract enforces on-chain consent before
+  `attest`, but a production flow should also handle consent expiry and
+  per-verifier scoping.
+- **No rate limiting** on the public `/verify` or the auth endpoints.
+- **Session tokens are stateless HMAC** with no revocation list; a leaked token
+  is valid until it expires (1h). Add server-side revocation for production.
