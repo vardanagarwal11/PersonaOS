@@ -67,10 +67,19 @@ export async function signIn(address) {
     throw new Error("Freighter couldn't sign the request. Check that it's unlocked.");
   }
 
-  // Freighter returns the signature as a base64 string or as bytes depending on
-  // version; normalise both to base64.
-  const raw = signed.signedMessage ?? signed;
-  const signature = typeof raw === "string" ? raw : bytesToBase64(raw);
+  // Freighter's shape shifts across versions: signedMessage may be a base64
+  // string (v4), a Buffer/Uint8Array (v3), or a JSON'd Buffer ({data:[...]}).
+  // Normalise all of them to a base64 string for the server.
+  const raw = signed.signedMessage ?? signed.signedBlob ?? signed;
+  let signature;
+  if (typeof raw === "string") {
+    signature = raw;
+  } else if (raw?.data && Array.isArray(raw.data)) {
+    signature = bytesToBase64(raw.data);
+  } else {
+    signature = bytesToBase64(raw);
+  }
+  if (!signature) throw new Error("Freighter returned no signature. Try reconnecting.");
 
   const { token } = await api("/auth/verify", {
     method: "POST",

@@ -1,5 +1,17 @@
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual, createHash } from "node:crypto";
 import { Keypair } from "@stellar/stellar-sdk";
+
+/**
+ * Freighter's signMessage follows SEP-53: it signs the SHA-256 of the message
+ * prefixed with "Stellar Signed Message:\n", NOT the raw message bytes. To
+ * verify, we must reconstruct the same digest the extension signed.
+ */
+const SEP53_PREFIX = "Stellar Signed Message:\n";
+function sep53Digest(message) {
+  return createHash("sha256")
+    .update(Buffer.concat([Buffer.from(SEP53_PREFIX, "utf8"), Buffer.from(message, "utf8")]))
+    .digest();
+}
 
 /**
  * Proof-of-key-ownership session auth.
@@ -53,10 +65,11 @@ export function verifyChallenge(address, signatureB64) {
 
   let ok = false;
   try {
-    ok = Keypair.fromPublicKey(address).verify(
-      Buffer.from(message, "utf8"),
-      Buffer.from(signatureB64, "base64")
-    );
+    const kp = Keypair.fromPublicKey(address);
+    const sig = Buffer.from(signatureB64, "base64");
+    // Freighter signs the SEP-53 digest; accept a raw-bytes signature too in
+    // case a wallet version signs the message directly.
+    ok = kp.verify(sep53Digest(message), sig) || kp.verify(Buffer.from(message, "utf8"), sig);
   } catch {
     throw new Error("That signature could not be read.");
   }
