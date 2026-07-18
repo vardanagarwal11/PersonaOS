@@ -28,9 +28,11 @@ function IssueInner() {
   const [step, setStep] = useState("idle");
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
+  const [needsData, setNeedsData] = useState(false);
 
   async function run() {
     setError("");
+    setNeedsData(false);
     setResult(null);
     try {
       setStep("consent");
@@ -39,7 +41,14 @@ function IssueInner() {
       setResult(await issueProfile(address, type));
       setStep("done");
     } catch (e) {
-      setError(e.message);
+      // 422 = not enough data in the vault. Point the user to fix it rather than
+      // showing a bare error.
+      if (e.status === 422) {
+        setNeedsData(true);
+        setError(e.detail || e.message);
+      } else {
+        setError(e.message);
+      }
       setStep("idle");
     }
   }
@@ -103,7 +112,22 @@ function IssueInner() {
                 <p className="font-sans font-light text-xs text-black/40 mt-5 leading-relaxed">
                   {busy ? STEPS[step] : "Two signatures: your consent, then the issuer's seal."}
                 </p>
-                <ErrorNote>{error}</ErrorNote>
+                {needsData ? (
+                  <div className="mt-5 rounded-xl border border-[#b4483c]/20 bg-[#b4483c]/5 p-5">
+                    <p className="font-barlow text-[10px] font-semibold uppercase tracking-[0.18em] text-[#b4483c] mb-2">
+                      Nothing to prove yet
+                    </p>
+                    <p className="font-sans font-light text-sm text-black/70 leading-relaxed mb-4">
+                      {error} A proof is built from your real transactions — add a bank statement, GitHub, or
+                      résumé, then come back.
+                    </p>
+                    <PillButton href="/vault" tone="plum">
+                      Go to your Vault
+                    </PillButton>
+                  </div>
+                ) : (
+                  <ErrorNote>{error}</ErrorNote>
+                )}
               </div>
             </Card>
           </div>

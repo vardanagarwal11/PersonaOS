@@ -8,7 +8,8 @@ import { fileURLToPath } from "node:url";
 import { Keypair } from "@stellar/stellar-sdk";
 import { profileHash, signProfile, verifyProfileSignature, attestationId, canonicalJson } from "./crypto.js";
 import * as chain from "./stellar.js";
-import { buildProfile, PROFILE_TYPES } from "./profiles.js";
+import { PROFILE_TYPES } from "./profiles.js";
+import { hasEnoughData } from "./scoring.js";
 import { loadVault, mergeVault, saveVault } from "./vault.js";
 import { parseBankCsv, parseGithub, parseResumeText, parseLinkedInExport } from "./ingest.js";
 import { classifyTransactions, buildAiProfile, aggregateFacts } from "./gemini.js";
@@ -291,28 +292,45 @@ app.post("/persona/:type", { preHandler: ownsBody }, async (req, reply) => {
   // own key). The contract rejects attest() without it, so there is no path here
   // that issues a proof the subject didn't agree to.
 
-  // AI path: generate from the user's economic-memory facts. Falls back to the
-  // mock builder when AI is off, the vault is empty, or the AI is unreachable.
-  let profile;
-  if (AI_ENABLED) {
-    try {
-      let rec = await loadVault(subjectPub);
-      rec = await classifyAndStore(subjectPub, rec);
-      const facts = aggregateFacts(rec);
-      if (rec.transactions.length || rec.work.length) {
-        profile = await buildAiProfile(type, { subjectPub, facts, resumeText: rec.resumeText });
-      }
-    } catch (e) {
-      app.log.warn({ err: e.message }, "AI profile generation failed; using baseline profile");
-    }
+  // A signed, anchored proof must never contain fabricated numbers. Load the
+  // user's economic memory, classify it, and refuse to issue if there isn't
+  // enough real data to stand behind a score.
+  let rec = await loadVault(subjectPub);
+  rec = await classifyAndStore(subjectPub, rec);
+  const facts = aggregateFacts(rec);
+
+  if (!hasEnoughData(type, facts)) {
+    return reply.code(422).send({
+      error: "Not enough data to issue this proof.",
+      detail:
+        "Add your financial history in the Vault first — a proof is generated from real transactions, never fabricated.",
+      have: { transactions: facts.txnCount, months: facts.monthsOfHistory, roles: facts.totalRoles },
+    });
   }
-  if (!profile) profile = buildProfile(type, { subjectPub });
+
+  // Numbers are computed deterministically by the scorer; Gemini only writes the
+  // explanation. Scoring never fails, so there is no mock fallback.
+  const profile = await buildAiProfile(type, { subjectPub, facts });
 
   const signature = signProfile(issuer, profile);
   const hash = profileHash(profile);
   const id = attestationId(issuer.publicKey(), subjectPub, type, nonce);
 
-  await chain.attest(issuer, { id, subjectPub, profileType: type, hash });
+  try {
+    await chain.attest(issuer, { id, subjectPub, profileType: type, hash });
+  } catch (e) {
+    const msg = String(e?.message || e);
+    // Contract error #3 = NoConsent. Consent is granted via /consent/* with the
+    // subject's own key before issuing.
+    if (/#3\b|NoConsent/.test(msg)) {
+      return reply.code(409).send({
+        error: "Consent hasn't been granted for this profile yet.",
+        detail: "Approve the consent step in your wallet before issuing this proof.",
+      });
+    }
+    app.log.error({ err: msg }, "attest failed");
+    return reply.code(502).send({ error: "Couldn't anchor the proof on Stellar. Try again." });
+  }
 
   const idHex = id.toString("hex");
   const store = await loadStore();

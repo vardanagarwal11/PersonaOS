@@ -43,7 +43,12 @@ export async function api(path, opts = {}) {
   }
 
   const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error || `The server returned ${res.status}.`);
+  if (!res.ok) {
+    const err = new Error(body.error || `The server returned ${res.status}.`);
+    err.status = res.status;
+    err.detail = body.detail;
+    throw err;
+  }
   return body;
 }
 

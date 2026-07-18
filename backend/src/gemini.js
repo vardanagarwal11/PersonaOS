@@ -1,4 +1,5 @@
 import { GoogleGenAI } from "@google/genai";
+import { scoreProfile } from "./scoring.js";
 
 /**
  * AI Semantic Engine (§5 of spec), backed by Gemini.
@@ -155,27 +156,65 @@ const PROFILE_INTENT = {
   insurance: "assess insurance risk: financial resilience and risk behavior",
 };
 
+// Reasoning is the only thing Gemini produces now — the numbers are fixed.
+const REASONING_SCHEMA = {
+  type: "object",
+  properties: { reasoning: { type: "array", items: { type: "string" }, minItems: 3, maxItems: 5 } },
+  required: ["reasoning"],
+};
+
 /**
- * Generate a profile from aggregated economic-memory facts (NOT raw txns).
- * Output is the signed+anchored object; `reasoning` is the explainability
- * requirement, produced structurally.
+ * Build a profile from aggregated facts.
+ *
+ * The scored fields (confidence, ratios, trends) are computed deterministically
+ * by scoreProfile — same facts always give the same numbers, and they're
+ * auditable. Gemini is handed those FINAL numbers and only writes the
+ * human-readable reasoning that explains them. It never decides a score, so it
+ * can't inflate or hallucinate one.
  */
 export async function buildAiProfile(profileType, { subjectPub, facts }) {
-  const schema = PROFILE_SCHEMAS[profileType];
-  if (!schema) throw new Error(`unknown profile type: ${profileType}`);
+  if (!PROFILE_SCHEMAS[profileType]) throw new Error(`unknown profile type: ${profileType}`);
+
+  const scored = scoreProfile(profileType, facts);
 
   const prompt = [
     `You are an explainable financial analyst. ${PROFILE_INTENT[profileType]}.`,
-    "Base every number ONLY on the provided facts. Never invent data.",
-    "Confidence 0-1 reflects how well the facts support the assessment.",
-    "reasoning: 3-5 short, concrete, human-readable bullet points citing the facts.",
+    "The assessment below has ALREADY been computed. Do NOT change any number.",
+    "Write 3-5 short, concrete, human-readable reasoning bullets that explain",
+    "these results by citing the underlying facts. Be honest about weaknesses",
+    "(e.g. thin history lowers confidence). Reference real figures from FACTS.",
+    "",
+    "COMPUTED RESULT:",
+    JSON.stringify(scored, null, 2),
     "",
     "FACTS:",
     JSON.stringify(facts, null, 2),
   ].join("\n");
 
-  const profile = await generateJson(prompt, schema);
-  return { profileType, subject: subjectPub, version: 1, ...profile };
+  let reasoning;
+  try {
+    ({ reasoning } = await generateJson(prompt, REASONING_SCHEMA));
+  } catch {
+    // If the model is unreachable, fall back to a factual, non-AI explanation
+    // rather than failing — the numbers (which matter) are already computed.
+    reasoning = fallbackReasoning(profileType, scored, facts);
+  }
+
+  // Drop any null/unmeasured fields so the signed profile only asserts what we
+  // could actually measure.
+  const clean = Object.fromEntries(Object.entries(scored).filter(([, v]) => v != null && v !== "unknown"));
+  return { profileType, subject: subjectPub, version: 1, ...clean, reasoning };
+}
+
+function fallbackReasoning(type, scored, f) {
+  const out = [
+    `Assessment based on ${f.txnCount} transactions across ${f.monthsOfHistory} month(s) of history.`,
+  ];
+  if (scored.confidence != null) out.push(`Overall confidence computed at ${Math.round(scored.confidence * 100)}%.`);
+  if (f.monthsOfHistory <= 1) out.push("Confidence is capped: only one month of history is available.");
+  if (scored.debtRatio != null) out.push(`Debt-to-income ratio is approximately ${Math.round(scored.debtRatio * 100)}%.`);
+  if (scored.savingsTrend) out.push(`Net cash flow trend is ${scored.savingsTrend}.`);
+  return out.slice(0, 5);
 }
 
 // --- 5.2 embeddings for economic-memory recall ---
@@ -195,14 +234,36 @@ export function aggregateFacts(record) {
   const byCat = {};
   let credits = 0,
     debits = 0;
+
+  // Per-month rollups drive the stability and trend signals in scoring.
+  const monthly = {}; // "YYYY-MM" -> { income, spend }
   for (const t of txns) {
     const cat = t.category || "unclassified";
     byCat[cat] = (byCat[cat] || 0) + t.amount;
     if (t.amount >= 0) credits += t.amount;
     else debits += -t.amount;
+
+    const ym = (t.date || "").slice(0, 7);
+    if (ym) {
+      const m = (monthly[ym] ??= { income: 0, spend: 0 });
+      if (t.amount >= 0) m.income += t.amount;
+      else m.spend += -t.amount;
+    }
   }
+
   const salaryTxns = txns.filter((t) => t.category === "salary" && t.amount > 0);
-  const monthsSpan = monthSpan(txns);
+  const monthKeys = Object.keys(monthly).sort();
+  const incomeSeries = monthKeys.map((k) => round(monthly[k].income));
+  const netSeries = monthKeys.map((k) => round(monthly[k].income - monthly[k].spend));
+
+  // count of months where a bill/rent/EMI category went out — used for
+  // repayment consistency (did recurring obligations get paid each month?)
+  const obligationMonths = monthKeys.filter((k) =>
+    txns.some(
+      (t) => (t.date || "").slice(0, 7) === k && t.amount < 0 && /rent|loan_repayment|utilities/.test(t.category || "")
+    )
+  ).length;
+
   return {
     totalCredits: round(credits),
     totalDebits: round(debits),
@@ -210,11 +271,18 @@ export function aggregateFacts(record) {
     byCategory: Object.fromEntries(Object.entries(byCat).map(([k, v]) => [k, round(v)])),
     salaryCount: salaryTxns.length,
     avgSalary: salaryTxns.length ? round(salaryTxns.reduce((a, t) => a + t.amount, 0) / salaryTxns.length) : 0,
-    monthsOfHistory: monthsSpan,
+    monthsOfHistory: monthKeys.length || monthSpan(txns),
+    monthlyIncome: incomeSeries,
+    monthlyNet: netSeries,
+    obligationMonths,
     txnCount: txns.length,
     verifiedRoles: (record.work || []).filter((w) => w.verified).length,
     totalRoles: (record.work || []).length,
     skills: (record.skills || []).map((s) => s.name),
+    freelanceTotal: round(Math.abs(byCat.freelance || 0)),
+    freelanceMonths: monthKeys.filter((k) =>
+      txns.some((t) => (t.date || "").slice(0, 7) === k && t.category === "freelance" && t.amount > 0)
+    ).length,
   };
 }
 
