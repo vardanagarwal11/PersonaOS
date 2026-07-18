@@ -36,7 +36,26 @@ stellar contract invoke --id <CONTRACT_ID> --source issuer \
   -- init --issuer <ISSUER_ADDRESS>
 ```
 
-## Backend
+## Quick start
+
+One command boots the backend (:4000) and frontend (:4001) together. It installs
+deps on first run and creates `frontend/.env` if missing. You still need a
+filled-in `backend/.env` (copy from `backend/.env.example`).
+
+```bash
+# from the repo root
+npm install     # installs root + backend + frontend deps
+npm run dev     # starts both; open http://localhost:4001
+```
+
+Platform launchers do the same with separate log windows:
+
+```bash
+./start.sh          # macOS / Linux  (--fresh to reinstall deps)
+./start.ps1         # Windows        (-Fresh to reinstall deps)
+```
+
+## Backend (run alone)
 
 ```bash
 cd backend
