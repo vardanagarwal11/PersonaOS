@@ -96,18 +96,23 @@ function scoreHiring(f) {
   const incomeStability = stability(f.monthlyIncome);
   const roleScore = clamp(f.verifiedRoles / 2); // 2+ verified roles = full
   const reputation = f.totalRoles > 0 ? clamp(f.verifiedRoles / f.totalRoles) : null;
+  // Skill breadth: 8+ distinct skills = full. Diminishing, so it rewards a real
+  // profile without letting someone inflate the score by listing 50 keywords.
+  const skillScore = f.distinctSkills > 0 ? clamp(f.distinctSkills / 8) : null;
   const depth = historyDepth(f.monthsOfHistory);
 
   const confidence = blend([
-    [incomeStability, 0.35],
-    [roleScore, 0.35],
-    [reputation, 0.2],
+    [incomeStability, 0.3],
+    [roleScore, 0.3],
+    [reputation, 0.15],
+    [skillScore, 0.15],
     [depth, 0.1],
   ]);
 
   return {
     incomeStability: incomeStability == null ? null : round2(incomeStability),
     verifiedRoles: f.verifiedRoles,
+    skillCount: f.distinctSkills,
     projectCompletion: reputation == null ? null : round2(reputation),
     reputation: reputation == null ? null : round2(reputation),
     confidence: confidence == null ? 0 : round2(confidence * depthPenalty(f.monthsOfHistory)),

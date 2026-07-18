@@ -119,6 +119,7 @@ const PROFILE_SCHEMAS = {
     properties: {
       incomeStability: { type: "number" },
       verifiedRoles: { type: "number" },
+      skillCount: { type: "number" },
       projectCompletion: { type: "number" },
       reputation: { type: "number" },
       confidence: { type: "number" },
@@ -217,6 +218,54 @@ function fallbackReasoning(type, scored, f) {
   return out.slice(0, 5);
 }
 
+// --- résumé extraction: text -> structured work + skills ---
+
+const RESUME_SCHEMA = {
+  type: "object",
+  properties: {
+    work: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          role: { type: "string" },
+          org: { type: "string" },
+          start: { type: "string" },
+          end: { type: "string" },
+        },
+        required: ["role", "org"],
+      },
+    },
+    skills: { type: "array", items: { type: "string" } },
+  },
+  required: ["work", "skills"],
+};
+
+/**
+ * Extract structured work history and skills from résumé text.
+ *
+ * A résumé is self-reported, so extracted roles are marked verified:false — the
+ * hiring score weights them below GitHub/LinkedIn evidence. Returns the same
+ * partial shape as the other ingest parsers so it merges into the vault
+ * identically.
+ */
+export async function extractResume(text) {
+  const prompt = [
+    "Extract work history and skills from this résumé. Return only what is",
+    "explicitly stated — do not infer or embellish. Dates as YYYY-MM if present.",
+    "",
+    "RÉSUMÉ:",
+    text.slice(0, 20000),
+  ].join("\n");
+
+  const { work = [], skills = [] } = await generateJson(prompt, RESUME_SCHEMA);
+  return {
+    work: work.map((w) => ({ ...w, source: "resume", verified: false })),
+    skills: skills.map((name) => ({ name, evidence: "résumé", source: "resume" })),
+    uploadsMeta: [{ type: "resume", uploadedAt: null, chars: text.length }],
+  };
+}
+
 // --- 5.2 embeddings for economic-memory recall ---
 
 export async function embed(text) {
@@ -279,6 +328,9 @@ export function aggregateFacts(record) {
     verifiedRoles: (record.work || []).filter((w) => w.verified).length,
     totalRoles: (record.work || []).length,
     skills: (record.skills || []).map((s) => s.name),
+    // distinct skill names (case-insensitive) — a skill claimed from two
+    // sources shouldn't count twice
+    distinctSkills: [...new Set((record.skills || []).map((s) => s.name?.toLowerCase()).filter(Boolean))].length,
     freelanceTotal: round(Math.abs(byCat.freelance || 0)),
     freelanceMonths: monthKeys.filter((k) =>
       txns.some((t) => (t.date || "").slice(0, 7) === k && t.category === "freelance" && t.amount > 0)

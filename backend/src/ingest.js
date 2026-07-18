@@ -106,20 +106,8 @@ export async function parseGithub(username) {
   };
 }
 
-/**
- * Resume plain text -> loose work signals. The heavy lifting (structured
- * extraction) is done by the AI engine; here we just capture the raw text so
- * the engine can read it. Kept minimal on purpose.
- */
-export function parseResumeText(text) {
-  return {
-    uploadsMeta: [
-      { type: "resume", uploadedAt: new Date().toISOString(), chars: text.length },
-    ],
-    // stash raw text under a reserved key the AI engine consumes
-    _resumeText: text.slice(0, 20000),
-  };
-}
+/* Résumé extraction lives in gemini.js (extractResume) — it needs the model to
+   turn free text into structured work + skills. */
 
 /**
  * LinkedIn official data export: user downloads their archive ZIP from

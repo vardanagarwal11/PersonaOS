@@ -11,8 +11,8 @@ import * as chain from "./stellar.js";
 import { PROFILE_TYPES } from "./profiles.js";
 import { hasEnoughData } from "./scoring.js";
 import { loadVault, mergeVault, saveVault } from "./vault.js";
-import { parseBankCsv, parseGithub, parseResumeText, parseLinkedInExport } from "./ingest.js";
-import { classifyTransactions, buildAiProfile, aggregateFacts } from "./gemini.js";
+import { parseBankCsv, parseGithub, parseLinkedInExport } from "./ingest.js";
+import { classifyTransactions, buildAiProfile, aggregateFacts, extractResume } from "./gemini.js";
 import { createChallenge, verifyChallenge, addressFromToken, requireOwner } from "./auth.js";
 
 const AI_ENABLED = !!process.env.GEMINI_API_KEY;
@@ -168,16 +168,30 @@ app.post("/ingest/github", { preHandler: ownsBody }, async (req, reply) => {
   return { ok: true, skills: partial.skills.map((s) => s.name) };
 });
 
-/** Resume text ingest. Body: { subjectPub, text } */
+/**
+ * Résumé text ingest. Body: { subjectPub, text }
+ * Gemini extracts structured work + skills, which merge into the vault and feed
+ * the hiring score. Requires AI — without a key, résumé text can't be scored.
+ */
 app.post("/ingest/resume", { preHandler: ownsBody }, async (req, reply) => {
   const { subjectPub, text } = req.body || {};
   if (!subjectPub || !text) return reply.code(400).send({ error: "subjectPub and text required" });
-  const partial = parseResumeText(text);
-  const rec = await loadVault(subjectPub);
-  rec.resumeText = partial._resumeText;
-  rec.uploadsMeta.push(...partial.uploadsMeta);
-  await saveVault(subjectPub, rec);
-  return { ok: true, chars: text.length };
+  if (!AI_ENABLED) {
+    return reply.code(503).send({
+      error: "Résumé parsing needs the AI engine, which isn't configured.",
+      detail: "Add a bank statement or GitHub instead, or set GEMINI_API_KEY on the server.",
+    });
+  }
+
+  let partial;
+  try {
+    partial = await extractResume(text);
+  } catch {
+    return reply.code(502).send({ error: "Couldn't read that résumé. Try again in a moment." });
+  }
+  partial.uploadsMeta = partial.uploadsMeta.map((m) => ({ ...m, uploadedAt: new Date().toISOString() }));
+  await mergeVault(subjectPub, partial);
+  return { ok: true, roles: partial.work.length, skills: partial.skills.map((s) => s.name) };
 });
 
 /** LinkedIn export ingest. Body: { subjectPub, positionsCsv?, skillsCsv? } */
